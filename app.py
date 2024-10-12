@@ -1,101 +1,117 @@
 import streamlit as st
-from openai import OpenAI
 from openai import AzureOpenAI
-import PyPDF2
 from os import environ
-import langchain_openai
-from langchain_chroma import Chroma
-from langchain_community.document_loaders import TextLoader, PyPDFLoader
+import io
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import AzureChatOpenAI
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
-from langchain.schema import Document
+import PyPDF2
 
-st.title("📝 File Q&A with OpenAI")
-uploaded_file = st.file_uploader(
-    "Upload an article", 
-    type=("txt", "pdf"), 
-    accept_multiple_files=True
+st.title("📄 Interactive File Q&A")
+
+uploaded_docs = st.file_uploader("Upload your text or PDF documents", type=("txt", "pdf"), accept_multiple_files=True)
+
+query = st.chat_input(
+    "Ask a question based on the uploaded documents",
+    disabled=not uploaded_docs,
 )
 
-question = st.chat_input(
-    "Ask something about the article",
-    disabled=not uploaded_file,
+# init language model
+openai_llm = AzureChatOpenAI(
+    azure_deployment="gpt-4-deployment",
+    temperature=0.2,
+    api_version="2023-06-01-preview",
 )
 
-# init session state
-if "messages" not in st.session_state:
-    st.session_state["messages"] = [{"role": "assistant", "content": "Ask questions about the article!"}]
+# session state for file processing and msgs
+if "conversation" not in st.session_state:
+    st.session_state["conversation"] = [{"role": "assistant", "content": "Please upload documents and ask questions!"}]
+if "file_data" not in st.session_state:
+    st.session_state["file_data"] = {}
+if "file_chunks" not in st.session_state:
+    st.session_state["file_chunks"] = set()
 
-if "vectorstore" not in st.session_state:
-    st.session_state["vectorstore"] = {}
+for message in st.session_state.conversation:
+    st.chat_message(message["role"]).write(message["content"])
 
-#display chat msgs
-for msg in st.session_state.messages:
-    st.chat_message(msg["role"]).write(msg["content"])
-
-if question and uploaded_file:
-    document = ""
-    for file in uploaded_file:
-        if file.name not in st.session_state["vectorstore"]:
+if uploaded_docs:
+    for file in uploaded_docs:
+        if file.name not in st.session_state["file_data"]:
             try:
+                # Read plain text files
                 if file.type == "text/plain":
-                    # read content from txt files
-                    file_content = file.read().decode("utf-8")
-
+                    content = file.getvalue().decode("utf-8")
+                # Process PDF files
                 elif file.type == "application/pdf":
-                    # reading text from pdf
-                    pdf_reader = PyPDF2.PdfReader(file)
-                    file_content = ""
+                    pdf_reader = PyPDF2.PdfReader(io.BytesIO(file.getvalue()))
+                    content = ""
                     for page in pdf_reader.pages:
-                        file_content += page.extract_text()
+                        content += page.extract_text()
                 else:
-                    st.error(f"This is an unsupported file type for {file.name}. Pdf and .txt formats supported only.")
+                    st.error(f"Unsupported file type: {file.name}. Only .txt or .pdf formats are allowed.")
                     continue
-                        
-                document = Document(page_content=file_content, metadata={"source": file.name})
-
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1000,
-                    chunk_overlap=100
-                )
-                chunks = text_splitter.split_text(document)
                 
-                st.session_state["vectorstore"][file.name] = "\n\n".join([chunk.page_content for chunk in chunks])
+                doc = Document(page_content=content, metadata={"source": file.name})
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                doc_chunks = text_splitter.split_documents([doc])
                 
+                # saving chunks for retrieval
+                st.session_state["file_data"][file.name] = "\n\n".join([chunk.page_content for chunk in doc_chunks])
                 st.success(f"Processed {file.name}")
-            except Exception as e:
-                st.error(f"Error processing {file.name}: {str(e)}")
+            except Exception as error:
+                st.error(f"Error processing {file.name}: {error}")
 
-if st.session_state["vectorstore"]:
-    st.write("Processed files:")
-    for file in st.session_state["vectorstore"].keys():
-        st.write(f"- {file}")
+template_str = """
+You are an assistant providing concise answers. Use the context from the documents to answer the question briefly.
+Question: {question}
 
-if question and uploaded_file:
-    client = AzureOpenAI(
+Context: {context}
+
+Answer:
+"""
+prompt_template = PromptTemplate.from_template(template_str)
+
+if st.session_state["file_data"]:
+    st.write("Documents ready for queries:")
+    for doc_name in st.session_state["file_data"].keys():
+        st.write(f"- {doc_name}")
+
+    def retrieve_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    rag_chain = (
+        {"context": retrieve_docs, "question": RunnablePassthrough()} |
+        prompt_template |
+        openai_llm |
+        StrOutputParser()
+    )
+
+if query and uploaded_docs:
+    azure_client = AzureOpenAI(
         api_key=environ['AZURE_OPENAI_API_KEY'],
         api_version="2023-03-15-preview",
         azure_endpoint=environ['AZURE_OPENAI_ENDPOINT'],
         azure_deployment=environ['AZURE_OPENAI_MODEL_DEPLOYMENT'],
     )
 
-    # user input uploaded to chat
-    st.session_state.messages.append({"role": "user", "content": question})
-    st.chat_message("user").write(question)
+    st.session_state.conversation.append({"role": "user", "content": query})
+    st.chat_message("user").write(query)
 
     with st.chat_message("assistant"):
-        all_contents = "\n\n".join([f"Content of {filename}:\n{content}" 
-                                    for filename, content in st.session_state["vectorstore"].items()])
+        combined_content = "\n\n".join([f"Content of {filename}:\n{content}" 
+                                        for filename, content in st.session_state["file_data"].items()])
         
-        stream = client.chat.completions.create(
-            model="gpt-4o", 
+        stream = azure_client.chat.completions.create(
+            model="gpt-4-deployment",
             messages=[
-                {"role": "system", "content": f"The file content:\n\n{all_contents}"},
-                *st.session_state.messages
+                {"role": "system", "content": f"Here's the file content:\n\n{combined_content}"},
+                *st.session_state.conversation
             ],
             stream=True
         )
-        response = st.write_stream(stream)
+        assistant_response = st.write_stream(stream)
 
-    #show chat msg
-    st.session_state.messages.append({"role": "assistant", "content": response})
+    st.session_state.conversation.append({"role": "assistant", "content": assistant_response})
